@@ -2,26 +2,51 @@
 # 1. Download Clinical Trials Database and Saving Files                        #
 # Author: Felippe Lazar Neto, Universidade de São Paulo, 2024                  #
 # ============================================================================ #
+#
+# Purpose
+#   Downloads every cancer trial that was ACTIVELY RECRUITING on
+#   ClinicalTrials.gov (API v2) and splits the records into tidy tables, one per
+#   type of information. The unit of analysis is the trial (NCT number).
+#
+# Data snapshot
+#   Query run on 23 July 2024. The registry changes daily, so
+#   re-running this script returns a DIFFERENT set of trials. To reproduce the
+#   manuscript, use the parquet files already saved in data/ and start from
+#   script 02.
+#
+# Query  : query.cond = 'cancer' AND filter.overallStatus = 'RECRUITING'
+#          -> 19,523 trials with at least one listed site
+#
+# Input  : ClinicalTrials.gov API v2 (https://clinicaltrials.gov/data-api/api)
+# Output : data/trial_information.parquet          one row per trial
+#          data/trial_conditions.parquet           one row per trial x condition
+#          data/trial_phase_design.parquet         one row per trial x phase
+#          data/trial_locations_contacts.parquet   one row per trial x site
+#          data/trial_arms_interventions.parquet   one row per trial x arm x intervention
+#
+# Next   : 02_filtering_data.R
+# ============================================================================ #
 
 # Loading Required Packages
 library(httr)
 library(jsonlite)
-library(listviewer)
-library(purrr)
-library(data.table)
-library(dplyr)
 library(tidyverse)
 library(glue)
 
 # ============================================================================ #
-# 1. Creating Function to Help Parse JSON (from ClinicalTrialsAPI)
+# 1. Functions to Parse the JSON Returned by the ClinicalTrials.gov API
 
+# Replaces NULL (field absent in the record) by NA so t() below does not fail
 default_value <- function(value) {if (is.null(value)) NA else value}
 
+# Extracts the fields used in the study from ONE trial of an API page.
+# Multi-valued fields (conditions, phases, arms) are transposed into one column
+# per value (e.g. study_conditions.1, study_conditions.2, ...) and reshaped to
+# long format in Section 3.
 tidyClinTrialsStudy <- function(n_study, data){
-  
+
   cat('  - Pulling Study: ', n_study, '\n', sep = '')
-  
+
   studyInfo <- list(
     'study_nct_id' = data$studies$protocolSection$identificationModule$nctId[[n_study]],
     'study_acronym' = data$studies$protocolSection$identificationModule$acronym[[n_study]],
@@ -43,30 +68,35 @@ tidyClinTrialsStudy <- function(n_study, data){
     'study_arms_interventions_names' = t(default_value(data$studies$protocolSection$armsInterventionsModule$armGroups[[n_study]]$interventionNames)),
     'study_arms_interventions_types' = t(default_value(data$studies$protocolSection$armsInterventionsModule$armGroups[[n_study]]$type))
     )
-  
+
+  # Any remaining missing field is recorded as the string 'N/A'
   studyInfo <- lapply(studyInfo, function(x) {if(is.null(x)) return('N/A') else return(x)})
-  
+
   return(studyInfo)
-  
+
 }
 
+# Applies tidyClinTrialsStudy() to every trial in one API page and binds rows
 tidyClinTrialsAPI <- function(data){
-  
+
   n_articles <- length(data$studies$protocolSection$identificationModule$nctId)
   content_list <- lapply(1:n_articles, tidyClinTrialsStudy, data)
   dataframes_list <- lapply(1:length(content_list), function(x) {return(as.data.frame(content_list[[x]]))})
   return(do.call(bind_rows, dataframes_list))
-  
+
 }
 
+# Same logic as longGoogleLocations() in 00_aux_functions.R: extracts the
+# columns of ONE arm (0 = first arm, 1 = second, ...) and gives them common
+# names so all arms can be stacked into long format.
 getTreatmentInfo <- function(col_number, dataframe){
-      
+
       if(col_number == 0) col_id <- '' else col_id <- glue('.{col_number}')
-      
+
       new_dataframe <- dataframe %>%
-            dplyr::select(study_nct_id, 
-                          glue('study_arms_interventions_types{col_id}'), 
-                          glue('study_arms_interventions_names{col_id}'), 
+            dplyr::select(study_nct_id,
+                          glue('study_arms_interventions_types{col_id}'),
+                          glue('study_arms_interventions_names{col_id}'),
                           glue('study_arms_interventions_label{col_id}')
             ) %>%
             dplyr::rename(
@@ -76,14 +106,13 @@ getTreatmentInfo <- function(col_number, dataframe){
             ) %>%
             dplyr::mutate(study_arms_intervention_number = glue('{col_number}')) %>%
             dplyr::distinct_all()
-      
-      
+
       return(new_dataframe)
-      
+
 }
 
 # ============================================================================ #
-# 2. Downloading from ClinicalTrialsAPI
+# 2. Downloading from ClinicalTrials.gov API (v2)
 
 # Setting the Base URL for Downloading
 base_url <- "https://clinicaltrials.gov/api/v2/studies"
@@ -98,57 +127,58 @@ query_search <- list(
   query.cond = 'cancer'
 )
 
-# Downloading Clinical Trials Information from API - 23th July 2024
-# Initiating the For Looping
+# The API returns results in pages. Each response carries a 'nextPageToken'
+# that is sent with the following request; the loop stops when there is none.
 search_list <- list()
 search_number <- 0
 boolPageToken <- TRUE
 
 while(boolPageToken){
-      
+
       search_number = search_number + 1
       cat('Pulling Batch: ', search_number, '\n')
       if(search_number != 1){query_search[['pageToken']] <- data$nextPageToken}
-      
+
       # Creating GET response
       response <- GET(
             url = base_url,
             query = query_search,
             add_headers(.headers = custom_headers)
       )
-      
+
       content <- content(response, "text", encoding = "UTF-8")
       data <- fromJSON(content)
       search_list[[search_number]] <- tidyClinTrialsAPI(data)
       boolPageToken <- !is.null(data$nextPageToken)
-      
+
 }
 
 # ============================================================================ #
-# 3. Tidying the Dataset Downloaded and Separating It By Different Parts of Information
-# The Unit of Interest is the NCT number
+# 3. Tidying the Downloaded Dataset and Splitting It by Type of Information
+# The unit of interest is the NCT number. Every output table is keyed by
+# study_nct_id and can be joined back to trial_information.parquet.
 
 # Transforming All in One DataFrame
 df_all <- do.call(bind_rows, search_list)
 str(df_all)
 
-# Exporting Trial Information
+# Trial-level information (title, status, design type, primary purpose, sponsor)
 df_all %>%
       dplyr::select(study_nct_id, study_acronym, study_official_title, study_brief_title, study_brief_summary, study_eligibility_criteria,
-             study_status, study_status_verified_date, study_design_primary_purpose, study_design_type, 
+             study_status, study_status_verified_date, study_design_primary_purpose, study_design_type,
              study_lead_sponsor_name, study_lead_sponsor_type, study_responsible_party) %>%
       dplyr::distinct_all() %>%
       arrow::write_parquet('data/trial_information.parquet')
 
-# Exporting Tumor Conditions
-df_all %>% 
+# Conditions (one row per trial x condition, as registered by the sponsor)
+df_all %>%
       dplyr::select(study_nct_id, starts_with('study_conditions')) %>%
       tidyr::pivot_longer(cols = starts_with('study_conditions'), values_to = 'study_condition', names_to = NULL) %>%
       dplyr::filter(!is.na(study_condition)) %>%
       dplyr::distinct_all() %>%
       arrow::write_parquet('data/trial_conditions.parquet')
 
-# Exporting Phase Design
+# Phase (one row per trial x phase; a Phase 2/3 trial has two rows: PHASE2 and PHASE3)
 df_all %>%
       dplyr::select(study_nct_id, starts_with('study_design_phase')) %>%
       tidyr::pivot_longer(cols = starts_with('study_design_phase'), values_to = 'study_design_phase', names_to = NULL) %>%
@@ -156,23 +186,25 @@ df_all %>%
       dplyr::distinct_all() %>%
       arrow::write_parquet('data/trial_phase_design.parquet')
 
-# Exporting Locations
+# Sites (one row per trial x listed facility; facility, city, state, zip,
+# country, recruitment status, contacts and the geoPoint provided by the registry)
 df_all %>%
       dplyr::select(study_nct_id, starts_with('study_locations')) %>%
       unnest(cols = c(study_locations.contacts, study_locations.geoPoint)) %>%
       distinct_all() %>%
       arrow::write_parquet('data/trial_locations_contacts.parquet')
 
-# Exporting Interventions
+# Arms and interventions (one row per trial x arm x intervention)
 df_arms <- df_all %>%
       select(study_nct_id, starts_with('study_arms_interventions'))
 
-list_treatment_arms <- lapply(0:27, getTreatmentInfo, df_arms)
+# Number of arm column sets = maximum number of arms in a single trial
+# (28 in the July 2024 snapshot, i.e. candidates 0:27)
+n_arms_max <- sum(grepl('^study_arms_interventions_types', names(df_arms)))
+list_treatment_arms <- lapply(0:(n_arms_max - 1), getTreatmentInfo, df_arms)
 df_arms_tidy <- do.call(rbind, list_treatment_arms)
 
 df_arms_tidy %>%
       unnest(cols = c(study_arms_interventions_names)) %>%
       distinct_all() %>%
       arrow::write_parquet('data/trial_arms_interventions.parquet')
-
-
